@@ -1,0 +1,26 @@
+[package]
+name = "td"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A minimalist terminal todo list"
+license = "MIT"
+repository = "https://github.com/leungchristopher/todo"
+readme = "README.md"
+keywords = ["todo", "tui", "terminal", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "td"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
