@@ -132,6 +132,110 @@ fn unescape(s: &str) -> String {
     out
 }
 
+/// A place to log progress on something long-running, so picking it back up
+/// after a context switch is a read rather than an archaeology dig.
+#[derive(Debug, Clone)]
+pub struct Project {
+    /// Session-local handle, as with Todo. Not persisted.
+    pub id: u64,
+    pub created: DateTime<Local>,
+    /// Last time the log was written. Shown in the list so the stalest
+    /// projects are obvious at a glance.
+    pub updated: DateTime<Local>,
+    pub name: String,
+    pub log: String,
+}
+
+impl Project {
+    pub fn new(id: u64, name: String) -> Self {
+        let now = Local::now();
+        Project {
+            id,
+            created: now,
+            updated: now,
+            name,
+            log: String::new(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}",
+            self.created.to_rfc3339(),
+            self.updated.to_rfc3339(),
+            escape(&self.name),
+            escape(&self.log),
+        )
+    }
+
+    fn decode(line: &str, id: u64) -> Option<Project> {
+        let mut f = line.splitn(4, '\t');
+        let created = parse_stamp(f.next()?)?;
+        let updated = parse_stamp(f.next()?)?;
+        let name = unescape(f.next()?);
+        let log = unescape(f.next().unwrap_or(""));
+        Some(Project {
+            id,
+            created,
+            updated,
+            name,
+            log,
+        })
+    }
+}
+
+pub struct Projects {
+    pub items: Vec<Project>,
+    path: PathBuf,
+    next_id: u64,
+}
+
+impl Projects {
+    pub fn load(path: PathBuf) -> io::Result<Projects> {
+        let mut items = Vec::new();
+        let mut next_id = 0;
+        if let Ok(text) = fs::read_to_string(&path) {
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(p) = Project::decode(line, next_id) {
+                    items.push(p);
+                    next_id += 1;
+                }
+            }
+        }
+        Ok(Projects {
+            items,
+            path,
+            next_id,
+        })
+    }
+
+    pub fn next_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut body = String::new();
+        for p in &self.items {
+            body.push_str(&p.encode());
+            body.push('\n');
+        }
+        let tmp = tmp_path(&self.path);
+        fs::write(&tmp, body)?;
+        fs::rename(&tmp, &self.path)
+    }
+
+    pub fn index_of(&self, id: u64) -> Option<usize> {
+        self.items.iter().position(|p| p.id == id)
+    }
+}
+
 pub struct Store {
     /// The live list.
     pub todos: Vec<Todo>,
@@ -355,6 +459,45 @@ mod tests {
         for line in ["", "garbage", "1\tnot-a-date\t-\ttitle\t", "1"] {
             assert!(
                 Todo::decode(line, 0).is_none(),
+                "{line:?} should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn project_round_trips_through_a_line() {
+        let mut p = Project::new(0, "td rewrite".into());
+        p.log = "day 1: sketched the parser\nday 2: it works\there".into();
+        p.updated = Local::now() + chrono::Duration::seconds(30);
+
+        let line = p.encode();
+        assert_eq!(
+            line.matches('\t').count(),
+            3,
+            "fields must stay tab-delimited"
+        );
+        assert!(!line.contains('\n'), "a project must stay on one line");
+
+        let back = Project::decode(&line, 0).expect("should decode");
+        assert_eq!(back.name, p.name);
+        assert_eq!(back.log, p.log);
+        assert_eq!(back.created.timestamp(), p.created.timestamp());
+        assert_eq!(back.updated.timestamp(), p.updated.timestamp());
+    }
+
+    #[test]
+    fn a_project_with_an_empty_log_survives_a_round_trip() {
+        let p = Project::new(0, "fresh".into());
+        let back = Project::decode(&p.encode(), 0).expect("should decode");
+        assert_eq!(back.name, "fresh");
+        assert_eq!(back.log, "");
+    }
+
+    #[test]
+    fn project_decode_rejects_junk_without_panicking() {
+        for line in ["", "garbage", "not-a-date\tnot-a-date\tname\t", "x"] {
+            assert!(
+                Project::decode(line, 0).is_none(),
                 "{line:?} should not decode"
             );
         }

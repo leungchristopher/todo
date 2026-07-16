@@ -7,21 +7,22 @@ use crossterm::{cursor, queue};
 
 use crate::config::{Config, Theme};
 use crate::date;
-use crate::model::{Store, Todo};
+use crate::editor::Editor;
+use crate::model::{Project, Projects, Store, Todo};
 
 /// 256-colour indices rather than truecolour: macOS Terminal.app speaks 256
 /// colours but not 24-bit RGB.
-struct Palette {
-    bg: Color,
-    fg: Color,
-    dim: Color,
-    accent: Color,
-    done: Color,
-    overdue: Color,
-    sel: Color,
+pub struct Palette {
+    pub bg: Color,
+    pub fg: Color,
+    pub dim: Color,
+    pub accent: Color,
+    pub done: Color,
+    pub overdue: Color,
+    pub sel: Color,
 }
 
-fn palette(theme: Theme) -> Palette {
+pub fn palette(theme: Theme) -> Palette {
     match theme {
         Theme::Dark => Palette {
             bg: Color::AnsiValue(234),
@@ -47,6 +48,7 @@ fn palette(theme: Theme) -> Palette {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     List,
+    Projects,
     History,
 }
 
@@ -57,36 +59,49 @@ enum Row {
 
 pub struct App {
     store: Store,
+    projects: Projects,
     cfg: Config,
     view: View,
     sel: usize,
     scroll: usize,
     status: Option<String>,
     trash: Option<Todo>,
+    trash_project: Option<Project>,
     help: bool,
     quit: bool,
 }
 
 impl App {
-    pub fn new(mut store: Store, cfg: Config) -> App {
+    pub fn new(mut store: Store, projects: Projects, cfg: Config) -> App {
         store.sort(cfg.sort);
         App {
             store,
+            projects,
             cfg,
             view: View::List,
             sel: 0,
             scroll: 0,
             status: None,
             trash: None,
+            trash_project: None,
             help: false,
             quit: false,
         }
     }
 
+    /// The todos behind the current view. Meaningless in Projects — use
+    /// `len` for anything that has to work in every view.
     fn items(&self) -> &[Todo] {
         match self.view {
-            View::List => &self.store.todos,
+            View::Projects | View::List => &self.store.todos,
             View::History => &self.store.history,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self.view {
+            View::Projects => self.projects.items.len(),
+            _ => self.items().len(),
         }
     }
 
@@ -119,7 +134,7 @@ impl App {
             return Ok(());
         }
 
-        // Keys that mean the same thing in both views.
+        // Keys that mean the same thing in every view.
         match key.code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -143,29 +158,55 @@ impl App {
                 return Ok(());
             }
             KeyCode::Char('G') | KeyCode::End => {
-                self.sel = self.items().len().saturating_sub(1);
+                self.sel = self.len().saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Char('1') => {
+                self.go(View::List);
+                return Ok(());
+            }
+            KeyCode::Char('2') => {
+                self.go(View::Projects);
                 return Ok(());
             }
             KeyCode::Enter | KeyCode::Tab => {
+                if self.view == View::Projects {
+                    return self.open_project(out);
+                }
                 self.toggle_expand();
                 return Ok(());
             }
             KeyCode::Char('h') => {
-                self.toggle_view();
+                self.go(if self.view == View::History {
+                    View::List
+                } else {
+                    View::History
+                });
                 return Ok(());
             }
-            // Esc only backs out of history; it must not open it.
-            KeyCode::Esc if self.view == View::History => {
-                self.toggle_view();
+            // Esc backs out to the list; it must not open anything.
+            KeyCode::Esc if self.view != View::List => {
+                self.go(View::List);
                 return Ok(());
             }
             KeyCode::Char('m') => return self.toggle_theme(),
             KeyCode::Char('x') => return self.delete(),
             KeyCode::Char('u') => return self.undo_delete(),
-            KeyCode::Char('a') => return self.file_or_restore(),
             _ => {}
         }
 
+        if self.view == View::Projects {
+            match key.code {
+                KeyCode::Char('o') => return self.new_project(out),
+                KeyCode::Char('e') => return self.rename_project(out),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if let KeyCode::Char('a') = key.code {
+            return self.file_or_restore();
+        }
         if self.view == View::History {
             // The rest only makes sense against the live list.
             self.status = Some("history is read-only — a restores, h goes back".into());
@@ -218,18 +259,83 @@ impl App {
         Ok(())
     }
 
-    fn toggle_view(&mut self) {
-        self.view = match self.view {
-            View::List => View::History,
-            View::History => View::List,
-        };
+    /// Each view keeps its own cursor conceptually, but not literally: coming
+    /// back to a view starts at the top, which is where you look anyway.
+    fn go(&mut self, view: View) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
         self.sel = 0;
         self.scroll = 0;
+    }
+
+    // ---- projects --------------------------------------------------------
+
+    fn new_project(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let Some(name) = self.prompt(out, "project▸ ", "")? else {
+            return Ok(());
+        };
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        let id = self.projects.next_id();
+        self.projects
+            .items
+            .push(Project::new(id, name.trim().into()));
+        self.sel = self.projects.index_of(id).unwrap_or(self.sel);
+        self.save_projects()
+    }
+
+    fn rename_project(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let Some(p) = self.projects.items.get(self.sel) else {
+            return Ok(());
+        };
+        let current = p.name.clone();
+        let Some(name) = self.prompt(out, "project▸ ", &current)? else {
+            return Ok(());
+        };
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        self.projects.items[self.sel].name = name.trim().into();
+        self.save_projects()
+    }
+
+    /// Hands the whole screen to the editor and takes it back afterwards. The
+    /// log is only touched if the editor says it was written.
+    fn open_project(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let Some(p) = self.projects.items.get(self.sel) else {
+            return Ok(());
+        };
+        let mut ed = Editor::new(&p.name, &p.log, self.cfg.theme);
+        let Some(text) = ed.run(out)? else {
+            return Ok(());
+        };
+        let p = &mut self.projects.items[self.sel];
+        if p.log == text {
+            // An open-and-close with no real change shouldn't make a project
+            // look freshly worked on.
+            return Ok(());
+        }
+        p.log = text;
+        p.updated = chrono::Local::now();
+        let name = truncate(&p.name, 40);
+        self.status = Some(format!("“{name}” logged"));
+        self.save_projects()
+    }
+
+    fn save_projects(&mut self) -> io::Result<()> {
+        if let Err(e) = self.projects.save() {
+            self.status = Some(format!("could not save: {e}"));
+        }
+        Ok(())
     }
 
     /// `a` files a todo away from the list, or pulls one back out of history.
     fn file_or_restore(&mut self) -> io::Result<()> {
         match self.view {
+            View::Projects => Ok(()),
             View::List => {
                 let Some(t) = self.store.todos.get(self.sel) else {
                     return Ok(());
@@ -258,7 +364,7 @@ impl App {
     }
 
     fn move_sel(&mut self, delta: isize) {
-        let len = self.items().len();
+        let len = self.len();
         if len == 0 {
             return;
         }
@@ -267,7 +373,7 @@ impl App {
     }
 
     fn clamp_sel(&mut self) {
-        self.sel = self.sel.min(self.items().len().saturating_sub(1));
+        self.sel = self.sel.min(self.len().saturating_sub(1));
     }
 
     fn toggle_done(&mut self) -> io::Result<()> {
@@ -286,7 +392,7 @@ impl App {
     fn toggle_expand(&mut self) {
         let sel = self.sel;
         let items = match self.view {
-            View::List => &mut self.store.todos,
+            View::Projects | View::List => &mut self.store.todos,
             View::History => &mut self.store.history,
         };
         if let Some(t) = items.get_mut(sel) {
@@ -364,8 +470,18 @@ impl App {
     }
 
     fn delete(&mut self) -> io::Result<()> {
+        if self.view == View::Projects {
+            if self.sel >= self.projects.items.len() {
+                return Ok(());
+            }
+            let p = self.projects.items.remove(self.sel);
+            self.status = Some(format!("deleted “{}” — u to undo", truncate(&p.name, 40)));
+            self.trash_project = Some(p);
+            self.clamp_sel();
+            return self.save_projects();
+        }
         let list = match self.view {
-            View::List => &mut self.store.todos,
+            View::Projects | View::List => &mut self.store.todos,
             View::History => &mut self.store.history,
         };
         if self.sel >= list.len() {
@@ -379,6 +495,16 @@ impl App {
     }
 
     fn undo_delete(&mut self) -> io::Result<()> {
+        if self.view == View::Projects {
+            let Some(p) = self.trash_project.take() else {
+                self.status = Some("nothing to undo".into());
+                return Ok(());
+            };
+            let id = p.id;
+            self.projects.items.push(p);
+            self.sel = self.projects.index_of(id).unwrap_or(self.sel);
+            return self.save_projects();
+        }
         let Some(t) = self.trash.take() else {
             self.status = Some("nothing to undo".into());
             return Ok(());
@@ -471,9 +597,10 @@ impl App {
         let list_h = h.saturating_sub(3);
         if self.help {
             self.draw_help(out, top, w, list_h, &pal)?;
-        } else if self.items().is_empty() {
+        } else if self.len() == 0 {
             let msg = match self.view {
                 View::List => "nothing here yet - press o to add a todo".into(),
+                View::Projects => "no projects yet - press o to start one".into(),
                 View::History => format!(
                     "history is empty - ticked todos land here when you type :{}",
                     self.cfg.phrase
@@ -481,6 +608,8 @@ impl App {
             };
             queue!(out, cursor::MoveTo(2, top), SetForegroundColor(pal.dim))?;
             out.write_all(truncate(&msg, w.saturating_sub(3)).as_bytes())?;
+        } else if self.view == View::Projects {
+            self.draw_projects(out, top, w, list_h, &pal)?;
         } else {
             self.draw_list(out, top, w, list_h, &pal)?;
         }
@@ -492,6 +621,21 @@ impl App {
     fn draw_header(&self, out: &mut impl Write, w: usize, pal: &Palette) -> io::Result<()> {
         queue!(out, cursor::MoveTo(1, 0), SetForegroundColor(pal.accent))?;
         out.write_all(b"td")?;
+
+        // The tabs carry their own switch keys, so the second view is
+        // discoverable without opening the help.
+        for (key, label, view) in [
+            ("1", "todos", View::List),
+            ("2", "projects", View::Projects),
+        ] {
+            let active = self.view == view;
+            queue!(
+                out,
+                SetForegroundColor(if active { pal.accent } else { pal.dim })
+            )?;
+            out.write_all(format!("  {key} {label}").as_bytes())?;
+        }
+
         let right = match self.view {
             View::List => {
                 let done = self.store.todos.iter().filter(|t| t.done).count();
@@ -503,9 +647,16 @@ impl App {
                     self.cfg.theme.name()
                 )
             }
+            View::Projects => format!(
+                "{} logged · {}",
+                self.projects.items.len(),
+                self.cfg.theme.name()
+            ),
             View::History => {
-                queue!(out, SetForegroundColor(pal.dim))?;
-                out.write_all(" · history".as_bytes())?;
+                // History hangs off the todos tab rather than earning one of
+                // its own: it is where todos go, not a third place to work.
+                queue!(out, SetForegroundColor(pal.accent))?;
+                out.write_all("  · history".as_bytes())?;
                 format!(
                     "{} filed · {}",
                     self.store.history.len(),
@@ -596,6 +747,61 @@ impl App {
         Ok(())
     }
 
+    /// One line per project: the name, and when it was last written to. No
+    /// checkbox — a project is not something you finish.
+    fn draw_projects(
+        &mut self,
+        out: &mut impl Write,
+        top: u16,
+        w: usize,
+        list_h: usize,
+        pal: &Palette,
+    ) -> io::Result<()> {
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        }
+        if self.sel >= self.scroll + list_h {
+            self.scroll = self.sel + 1 - list_h;
+        }
+
+        for (n, (i, p)) in self
+            .projects
+            .items
+            .iter()
+            .enumerate()
+            .skip(self.scroll)
+            .take(list_h)
+            .enumerate()
+        {
+            let y = top + n as u16;
+            let selected = i == self.sel;
+            let bg = if selected { pal.sel } else { pal.bg };
+            queue!(out, cursor::MoveTo(0, y), SetBackgroundColor(bg))?;
+            out.write_all(" ".repeat(w).as_bytes())?;
+
+            queue!(out, cursor::MoveTo(0, y), SetForegroundColor(pal.accent))?;
+            out.write_all(if selected { "›".as_bytes() } else { b" " })?;
+
+            let right = if p.log.is_empty() {
+                "empty".to_string()
+            } else {
+                date::ago(p.updated.date_naive())
+            };
+            let right_w = right.chars().count();
+            queue!(out, cursor::MoveTo(2, y), SetForegroundColor(pal.fg))?;
+            out.write_all(truncate(&p.name, w.saturating_sub(right_w + 4)).as_bytes())?;
+
+            let x = w.saturating_sub(right_w + 1);
+            queue!(
+                out,
+                cursor::MoveTo(x as u16, y),
+                SetForegroundColor(pal.dim)
+            )?;
+            out.write_all(right.as_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Keeps the selected todo on screen, preferring to show its first line
     /// when the todo plus its details is taller than the viewport.
     fn update_scroll(&mut self, rows: &[Row], list_h: usize) {
@@ -622,13 +828,14 @@ impl App {
 
     fn help_keys(&self) -> Vec<(String, String)> {
         let mut keys: Vec<(&str, String)> = vec![
+            ("1 / 2", "todos / projects".into()),
             ("j / k", "move down / up".into()),
             ("g / G", "first / last".into()),
-            ("enter", "expand or collapse details".into()),
         ];
-        if self.view == View::List {
-            keys.extend([
-                ("space", "toggle done".to_string()),
+        match self.view {
+            View::List => keys.extend([
+                ("enter", "expand or collapse details".to_string()),
+                ("space", "toggle done".into()),
                 ("o", "new todo".into()),
                 ("e", "edit title".into()),
                 ("d", "edit details".into()),
@@ -636,12 +843,17 @@ impl App {
                 ("a", "file to history".into()),
                 ("s", "cycle sort: created / due / alpha".into()),
                 ("h", "show history".into()),
-            ]);
-        } else {
-            keys.extend([
-                ("a", "restore to the list, unticked".to_string()),
+            ]),
+            View::Projects => keys.extend([
+                ("enter", "open the log in the editor".to_string()),
+                ("o", "new project".into()),
+                ("e", "rename".into()),
+            ]),
+            View::History => keys.extend([
+                ("enter", "expand or collapse details".to_string()),
+                ("a", "restore to the list, unticked".into()),
                 ("h / esc", "back to the list".into()),
-            ]);
+            ]),
         }
         keys.extend([
             ("x", "delete".to_string()),
@@ -699,6 +911,9 @@ impl App {
             (Some(s), _) => s.clone(),
             (None, View::List) => {
                 "j/k move · space done · o new · t due · a file · h history · ? help".into()
+            }
+            (None, View::Projects) => {
+                "j/k move · enter open log · o new · e rename · 1 todos · ? help".into()
             }
             (None, View::History) => "j/k move · a restore · h back · ? help".into(),
         };
@@ -788,7 +1003,7 @@ impl Prompt {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }

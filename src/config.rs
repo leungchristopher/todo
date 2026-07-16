@@ -140,3 +140,9 @@ pub fn data_path() -> PathBuf {
         .join("td")
         .join("todos.txt")
 }
+
+/// Projects sit next to the todos, so pointing TD_FILE at a second list gets
+/// you that list's projects too.
+pub fn projects_path() -> PathBuf {
+    data_path().with_file_name("projects.txt")
+}

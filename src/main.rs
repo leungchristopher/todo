@@ -1,5 +1,6 @@
 mod config;
 mod date;
+mod editor;
 mod model;
 mod ui;
 
@@ -10,7 +11,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, style};
 
 use config::Config;
-use model::Store;
+use model::{Projects, Store};
 use ui::App;
 
 const USAGE: &str = "\
@@ -22,8 +23,9 @@ usage:
     td -v         show version
 
 files:
-    todos    $XDG_DATA_HOME/td/todos.txt   (default ~/.local/share/td/todos.txt)
-    config   $XDG_CONFIG_HOME/td/config    (default ~/.config/td/config)
+    todos      $XDG_DATA_HOME/td/todos.txt      (default ~/.local/share/td/todos.txt)
+    projects   $XDG_DATA_HOME/td/projects.txt   (kept next to the todos)
+    config     $XDG_CONFIG_HOME/td/config       (default ~/.config/td/config)
 
     Set TD_FILE to point at a different todo file.
 
@@ -62,7 +64,8 @@ fn main() -> ExitCode {
 fn run() -> io::Result<()> {
     let cfg = Config::load();
     let store = Store::load(config::data_path())?;
-    let mut app = App::new(store, cfg);
+    let projects = Projects::load(config::projects_path())?;
+    let mut app = App::new(store, projects, cfg);
 
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
