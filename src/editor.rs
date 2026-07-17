@@ -24,8 +24,10 @@ pub struct Editor {
     lines: Vec<Vec<char>>,
     row: usize,
     col: usize,
+    /// Index of the first logical line drawn. Long lines wrap onto extra visual
+    /// rows rather than scrolling sideways, so a single scroll offset in logical
+    /// lines is all we track.
     scroll: usize,
-    hscroll: usize,
     mode: Mode,
     cmd: String,
     /// First half of a two-key sequence: dd, gg, ZZ.
@@ -48,7 +50,6 @@ impl Editor {
             row: 0,
             col: 0,
             scroll: 0,
-            hscroll: 0,
             mode: Mode::Normal,
             cmd: String::new(),
             pending: None,
@@ -369,6 +370,29 @@ impl Editor {
 
     // ---- rendering -------------------------------------------------------
 
+    /// How many visual rows a logical line of `len` characters occupies when
+    /// wrapped at `text_w`. An empty line still takes one row to sit on.
+    fn line_rows(len: usize, text_w: usize) -> usize {
+        if len == 0 {
+            1
+        } else {
+            (len + text_w - 1) / text_w
+        }
+    }
+
+    /// The cursor's position within the body, in visual (row, col) cells counted
+    /// from the first drawn line. Assumes scroll_into_view has already run, so
+    /// `self.scroll <= self.row`.
+    fn cursor_visual(&self, text_w: usize) -> (usize, usize) {
+        let mut vrow = 0;
+        for r in self.scroll..self.row {
+            vrow += Self::line_rows(self.lines[r].len(), text_w);
+        }
+        // A full line the cursor sits just past (insert mode at a wrap boundary)
+        // puts the cursor at the start of a fresh visual row.
+        (vrow + self.col / text_w, self.col % text_w)
+    }
+
     fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
         let (w, h) = terminal::size()?;
         let (w, h) = (w as usize, h.max(4) as usize);
@@ -411,14 +435,31 @@ impl Editor {
         )?;
         out.write_all(right.as_bytes())?;
 
-        for (n, line) in self.lines.iter().skip(self.scroll).take(body_h).enumerate() {
-            let text: String = line.iter().skip(self.hscroll).take(text_w).collect();
-            queue!(
-                out,
-                cursor::MoveTo(1, 2 + n as u16),
-                SetForegroundColor(pal.fg)
-            )?;
-            out.write_all(text.as_bytes())?;
+        // Draw logical lines top to bottom, spilling each onto as many visual
+        // rows as it needs, until the body is full.
+        let mut y = 0usize;
+        'lines: for (li, line) in self.lines.iter().enumerate().skip(self.scroll) {
+            let len = line.len();
+            for seg in 0..Self::line_rows(len, text_w) {
+                if y >= body_h {
+                    break 'lines;
+                }
+                let start = seg * text_w;
+                let end = (start + text_w).min(len);
+                let text: String = line[start..end].iter().collect();
+                queue!(
+                    out,
+                    cursor::MoveTo(1, 2 + y as u16),
+                    SetForegroundColor(pal.fg)
+                )?;
+                out.write_all(text.as_bytes())?;
+                y += 1;
+            }
+            // Insert mode at the end of a line whose length lands exactly on a
+            // wrap boundary needs an extra blank row for the cursor to sit on.
+            if li == self.row && self.col == len && len > 0 && len % text_w == 0 && y < body_h {
+                y += 1;
+            }
         }
 
         let y = (h - 1) as u16;
@@ -446,9 +487,12 @@ impl Editor {
         )?;
         out.write_all(truncate(&hint, w.saturating_sub(2)).as_bytes())?;
 
-        let cx = 1 + self.col - self.hscroll;
-        let cy = 2 + self.row - self.scroll;
-        queue!(out, cursor::MoveTo(cx as u16, cy as u16), cursor::Show)?;
+        let (crow, ccol) = self.cursor_visual(text_w);
+        queue!(
+            out,
+            cursor::MoveTo(1 + ccol as u16, 2 + crow as u16),
+            cursor::Show
+        )?;
         out.flush()
     }
 
@@ -456,14 +500,15 @@ impl Editor {
         if self.row < self.scroll {
             self.scroll = self.row;
         }
-        if body_h > 0 && self.row >= self.scroll + body_h {
-            self.scroll = self.row + 1 - body_h;
-        }
-        if self.col < self.hscroll {
-            self.hscroll = self.col;
-        }
-        if self.col >= self.hscroll + text_w {
-            self.hscroll = self.col + 1 - text_w;
+        // Push the top down one logical line at a time until the cursor's visual
+        // row fits. A line taller than the whole body is pinned to the top
+        // rather than hiding the cursor entirely.
+        while self.scroll < self.row {
+            let (crow, _) = self.cursor_visual(text_w);
+            if crow < body_h {
+                break;
+            }
+            self.scroll += 1;
         }
     }
 }
@@ -580,5 +625,37 @@ mod tests {
         let mut e = ed("note");
         press(&mut e, "ZZ");
         assert!(e.quit && e.saved);
+    }
+
+    #[test]
+    fn a_line_wraps_onto_a_visual_row_per_screen_width() {
+        // Empty and short lines take one row; longer ones spill over.
+        assert_eq!(Editor::line_rows(0, 4), 1);
+        assert_eq!(Editor::line_rows(4, 4), 1);
+        assert_eq!(Editor::line_rows(5, 4), 2);
+        assert_eq!(Editor::line_rows(9, 4), 3);
+    }
+
+    #[test]
+    fn cursor_visual_follows_the_wrap() {
+        let mut e = ed("0123456789\nnext");
+        // Column 6 on a width-4 line sits on the second visual row, offset 2.
+        e.col = 6;
+        assert_eq!(e.cursor_visual(4), (1, 2));
+
+        // The second logical line starts below all three wrapped rows above it.
+        e.row = 1;
+        e.col = 0;
+        assert_eq!(e.cursor_visual(4), (3, 0));
+    }
+
+    #[test]
+    fn cursor_at_a_wrap_boundary_lands_on_a_fresh_row() {
+        // Insert mode sitting just past a line that fills the width exactly:
+        // the cursor moves to the start of the next visual row.
+        let mut e = ed("0123");
+        e.mode = Mode::Insert;
+        e.col = 4;
+        assert_eq!(e.cursor_visual(4), (1, 0));
     }
 }
